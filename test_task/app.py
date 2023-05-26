@@ -10,7 +10,7 @@ import pandas as pd
 import plotly.express as px
 
 
-connection = sqlite3.connect('тз/testDB.db')
+connection = sqlite3.connect('app_analyst/testDB.db')
 df = pd.read_sql_query('SELECT * FROM sources', con=connection)
 
 df_sum = df.groupby('reason').sum()
