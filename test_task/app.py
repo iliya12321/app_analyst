@@ -1,50 +1,20 @@
-from dash import html, Output, Input, State, dcc
-from dash_extensions.enrich import (DashProxy,
-                                    ServersideOutputTransform,
-                                    MultiplexerTransform)
 import dash_mantine_components as dmc
-from dash.exceptions import PreventUpdate
-
+import datetime as dt
 import sqlite3
-import pandas as pd
 import plotly.express as px
+from dataclasses import dataclass
 
+from dash import Input, Output, State
+from dash.dcc import Graph
+from dash.exceptions import PreventUpdate
+from dash.html import Div, H1
+from dash_extensions.enrich import (DashProxy, MultiplexerTransform,
+                                    ServersideOutputTransform)
+from pandas import read_sql
 
-connection = sqlite3.connect('тз/testDB.db')
-df = pd.read_sql_query('SELECT * FROM sources', con=connection)
-
-df_sum = df.groupby('reason').sum()
-
-df['state_end'] = pd.to_datetime(df.state_end)
-df['state_begin']= pd.to_datetime(df.state_begin)
-df['duration'] = (df.state_end - df.state_begin).apply(lambda x: f"{int(x.total_seconds() // 60)}.{int(x.total_seconds() % 60):02d} мин")
-
-circle = px.pie(df_sum, values='duration_hour', names=df_sum.index)
-circle.update_layout(margin=dict(t=0, b=0, l=0, r=0))
-
-def get_timeline(data_frame):
-    timeline = px.timeline(data_frame, x_start='state_begin', x_end='state_end', y='endpoint_name', template="plotly_white", color='color',
-                        hover_data=['state', 'reason', 'shift_day', 'period_name', 'operator', 'duration'])
-    timeline.update_yaxes(title_text='')
-    timeline.update_layout(showlegend=False, xaxis_tickformat='%H', title='График состояний',  title_x=0.5)
-    timeline.update_traces(hovertemplate=f"<br>Состояние - %{{customdata[0]}}<extra></extra>"
-                                        f"<br>Причина - %{{customdata[1]}}"
-                                        f"<br>Начало -  %{{base|%H:%M:%S (%d.%m)}}"
-                                        f"<br>Длительность - %{{customdata[5]}}<br>"
-                                        f"<br>Сменный день - %{{customdata[2]}}"
-                                        f"<br>Смена - %{{customdata[3]}}"
-                                        f"<br>Оператор - %{{customdata[4]}}<br>")
-    return timeline
-
-CARD_STYLE = dict(withBorder=True,
-                  shadow="sm",
-                  radius="md",
-                  style={'height': '400px'})
-
-CARD_LOWER_STYLE = dict(withBorder=True,
-            shadow="sm",
-            radius="md",
-            style={'height': '250px'})
+CARD_STYLE = dict(
+    withBorder=True, shadow='sm', radius='md', style={'height': '400px'}
+)
 
 
 class EncostDash(DashProxy):
@@ -55,69 +25,194 @@ class EncostDash(DashProxy):
 
 
 app = EncostDash(name=__name__)
+conn = sqlite3.connect('testDB.db', check_same_thread=False)
+
+
+@dataclass
+class MainDataFrame:
+    __df_main = read_sql('select * from sources', conn)
+    __df_reasons_info = read_sql(
+        'select reason, color from sources group by reason', conn
+    )
+    __df_pie = read_sql(
+        'select reason, sum(duration_min) from sources group by reason', conn
+    )
+    conn.close()
+
+    state_begin: str = (
+        __df_main.sort_values(by="state_begin").state_begin.iloc[0]
+    )
+    state_end: str = __df_main.sort_values(by="state_end").state_end.iloc[-1]
+    shift_day: str = __df_main['shift_day'].iloc[0]
+    endpoint_name: str = __df_main['endpoint_name'].iloc[0]
+    client_name: str = __df_main['client_name'].iloc[0]
+
+    def get_distinct_reasons(self):
+        return self.__df_reasons_info['reason'].tolist()
+
+    def get_states_colors(self):
+        return self.__df_reasons_info['color'].tolist()
+
+    def get_pie_df(self):
+        return self.__df_pie
+
+    def get_bar_df(self):
+        return self.__df_main
+
+    def get_color_map(self):
+        color_map = dict(zip(
+            self.get_distinct_reasons(),
+            self.get_states_colors(),
+        ))
+        return color_map
+
+
+def show_general_info():
+    df = MainDataFrame()
+    state_begin = dt.datetime.fromisoformat(df.state_begin)
+    state_end = dt.datetime.fromisoformat(df.state_end)
+
+    return dmc.Col([
+        dmc.Card([
+            Div(H1('Клиент: ' + df.client_name)),
+            Div(
+                'Сменный день: ' + df.shift_day,
+                style={"font-weight": "bold"}
+            ),
+            Div(
+                'Точка учета: ' + df.endpoint_name,
+                style={"font-weight": "bold"}
+            ),
+            Div(
+                f'Начало периода: {state_begin:%H:%M:%S (%d %b %Y)}',
+                style={"font-weight": "bold"}
+            ),
+            Div(
+                f'Конец периода: {state_end:%H:%M:%S (%d %b %Y)}',
+                style={"font-weight": "bold"}
+            ),
+            dmc.MultiSelect(
+                placeholder='Выберите состояние',
+                id='selected_filter',
+                clearable=True,
+                style={"marginBottom": 10},
+                data=df.get_distinct_reasons()
+            ),
+            dmc.Button('Фильтровать', id='filter_button'),
+            ], **CARD_STYLE)
+        ], span=6
+    )
+
+
+def show_pie_chart():
+    df_pie = MainDataFrame().get_pie_df()
+    color_map = MainDataFrame().get_color_map()
+
+    return dmc.Col([
+            dmc.Card([
+                    Div(
+                        Graph(
+                            figure=px.pie(
+                                df_pie,
+                                values='sum(duration_min)',
+                                names='reason',
+                                hole=0.2,
+                                color='reason',
+                                color_discrete_map=color_map,
+                            ).update_layout(margin=dict(t=0, b=180))
+                        ),
+                    )
+                ], **CARD_STYLE
+            )
+        ], span=6
+    )
+
+
+def create_gantt_chart():
+    df_bar = MainDataFrame().get_bar_df()
+    color_map = MainDataFrame().get_color_map()
+    custom_fields = [
+        'state', 'reason', 'state_begin', 'duration_min',
+        'shift_day', 'shift_name', 'operator',
+    ]
+
+    figure = px.timeline(
+        df_bar,
+        x_start='state_begin',
+        x_end='state_end',
+        y='endpoint_name',
+        color='reason',
+        color_discrete_map=color_map,
+        custom_data=[*custom_fields],
+        title='График состояний',
+        height=300
+    ).update_traces(
+        hovertemplate=(
+            'Состояние - <b>%{customdata[0]}</b><br>' +
+            'Причина - <b>%{customdata[1]}</b><br>' +
+            'Начало - <b>%{customdata[2]|%H:%M:%S (%d %b %Y)}</b><br>' +
+            'Длительность - <b>%{customdata[3]:,.2f}</b> мин.<br><br>' +
+            'Сменный день - <b>%{customdata[4]|%d %b %Y}</b><br>' +
+            'Смена - <b>%{customdata[5]}</b><br>' +
+            'Оператор - <b>%{customdata[6]}</b>'
+        ),
+    ).update_layout(
+        yaxis_title="",
+        title={
+            'font': dict(size=25),
+            'x': 0.5,
+            'y': 0.85
+        },
+        showlegend=False,
+        plot_bgcolor="#fff",
+    )
+
+    return figure
+
+
+def show_gantt_chart():
+    return dmc.Col([
+        dmc.Card([
+            Div(
+                Graph(
+                    figure=create_gantt_chart(),
+                    id='output'
+                ),
+            )
+        ])
+    ])
 
 
 def get_layout():
-    return html.Div([
-        dmc.Paper([
+    return Div(
+        dmc.Paper(
             dmc.Grid([
-                dmc.Col([
-                    dmc.Card([
-                        html.Div([
-                            html.H1('Клиент: Кирпичный завод'),
-                            html.P('Сменный день: 2023-05-12'),
-                            html.P('Клиент: Бетономешалка'),
-                            html.P('Начало периода: 08:00:00 (12.05)'),
-                            html.P('Конец периода: 08:00:00 (05.05)'),
-                        ]),
-                        html.Div([
-                            dcc.Dropdown(df['reason'].unique(),
-                                        id='reason_colomn', multi=True)
-                        ]),
-                        dmc.Button(
-                            children='Фильтровать',
-                            id='button1')],
-                        **CARD_STYLE)
-                ], span=6),
-                dmc.Col([
-                    dmc.Card([
-                        html.Div(dcc.Graph(figure=circle, style={'height': '350px'}))],
-                        **CARD_STYLE)
-                ], span=6),
-                dmc.Col([
-                    dmc.Card([
-                        html.Div([
-                            dcc.Graph(id='graphic_timeline', figure=get_timeline(df), style={'height': '250px'})
-                        ])],
-                        **CARD_LOWER_STYLE)
-                ], span=12),
-            ], gutter="xl",)
-        ])
-    ])
+                show_general_info(),
+                show_pie_chart(),
+                show_gantt_chart()
+            ], gutter='xl')
+        )
+    )
 
 
 app.layout = get_layout()
 
 
 @app.callback(
-    Output('graphic_timeline', 'figure'),
-    Input('button1', 'n_clicks'),
-    State('reason_colomn', 'value'),
+    Output('output', 'figure'),
+    [State('selected_filter', 'value')],
+    [Input('filter_button', 'n_clicks')],
     prevent_initial_call=True,
 )
-def update_div1(
-    click,
-    reasons
-):
+def update_card3(value, click):
     if click is None:
         raise PreventUpdate
-    
-    if not reasons:
-        return get_timeline(df)
 
-    filtered_df = df[df['reason'].isin(reasons)]
-    
-    return get_timeline(filtered_df)
+    figure = create_gantt_chart()
+    if value:
+        for dat in figure.data:
+            dat['marker']['opacity'] = 1 if dat['name'] in value else 0.3
+    return figure
 
 
 if __name__ == '__main__':
